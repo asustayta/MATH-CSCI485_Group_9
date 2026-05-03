@@ -1,4 +1,4 @@
-# Predicting the Life Expectancy in California 
+# Predicting Life Expectancy in California 
 
 **Author:** Maya A., Matthew B., Neil M., Anna S.
 
