@@ -1,0 +1,167 @@
+```{r}
+library(tidyverse)
+library(glmnet)
+library(rsample)
+library(randomForest)
+library(xgboost)
+library(yardstick)
+library(ggplot2)
+```
+
+```{r}
+data <- read.csv("hpi_clean_full.csv")
+```
+
+```{r}
+set.seed(42)
+
+# 80/20 train-test split (stratified by income_quartile)
+split <- initial_split(data, prop = 0.80, strata = income_quartile)
+train_data <- training(split)
+test_data <- testing(split)
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Test rows:    ", nrow(test_data), "\n")
+```
+
+```{r}
+var_groups <- readRDS("variable_groups.rds")
+indicators_raw <- var_groups$indicators_raw
+domain_scores <- var_groups$domain_scores
+demo_vars <- var_groups$demo_vars
+response_var <- var_groups$response_var
+
+# Re-apply factor levels lost during CSV write
+train_data <- train_data %>%
+  mutate(
+    income_quartile = factor(income_quartile,
+                             levels = c("Q1_low", "Q2", "Q3", "Q4_high")),
+    hpi_quartile = factor(hpi_quartile),
+    urban_type = factor(urban_type)
+  )
+ 
+test_data <- test_data %>%
+  mutate(
+    income_quartile = factor(income_quartile,
+                             levels = c("Q1_low", "Q2", "Q3", "Q4_high")),
+    hpi_quartile    = factor(hpi_quartile),
+    urban_type      = factor(urban_type)
+  )
+ 
+```
+
+```{r}
+bay_area <- c(
+  "Alameda", "Contra Costa", "Marin", "Napa", "San Francisco",
+  "San Mateo", "Santa Clara", "Solano", "Sonoma"
+)
+socal <- c(
+  "Los Angeles", "Orange", "Riverside", "San Bernardino",
+  "San Diego", "Imperial", "Ventura"
+)
+central_valley <- c(
+  "Fresno", "Kern", "Kings", "Madera", "Merced",
+  "San Joaquin", "Stanislaus", "Tulare"
+)
+norcal <- c(
+  "Butte", "Colusa", "Del Norte", "Glenn", "Humboldt", "Lake",
+  "Lassen", "Mendocino", "Modoc", "Plumas", "Shasta", "Sierra",
+  "Siskiyou", "Tehama", "Trinity"
+)
+ 
+assign_region <- function(county_name) {
+  case_when(
+    county_name %in% bay_area       ~ "Bay Area",
+    county_name %in% socal          ~ "SoCal",
+    county_name %in% central_valley ~ "Central Valley",
+    county_name %in% norcal         ~ "NorCal",
+    TRUE                            ~ "Other CA"
+  )
+}
+ 
+train_data <- train_data %>%
+  mutate(region = factor(assign_region(county)))
+ 
+test_data <- test_data %>%
+  mutate(region = factor(assign_region(county)))
+ 
+final_df <- final_df %>%
+  mutate(region = factor(assign_region(county)))
+ 
+cat("Region distribution in training data:\n")
+print(table(train_data$region))
+```
+
+```{r}
+lasso_vars <- c(indicators_raw, demo_vars)
+ 
+x_train <- train_data %>%
+  select(all_of(lasso_vars)) %>%
+  drop_na() %>%
+  as.matrix()
+ 
+y_train <- train_data %>%
+  filter(complete.cases(select(., all_of(lasso_vars)))) %>%
+  pull(leb_cdc)
+ 
+x_test <- test_data %>%
+  select(all_of(lasso_vars)) %>%
+  drop_na() %>%
+  as.matrix()
+ 
+y_test <- test_data %>%
+  filter(complete.cases(select(., all_of(lasso_vars)))) %>%
+  pull(leb_cdc)
+ 
+# Cross-validated LASSO to find optimal lambda
+set.seed(42)
+lasso_cv <- cv.glmnet(
+  x         = x_train,
+  y         = y_train,
+  alpha     = 1,          # alpha=1 is LASSO (alpha=0 is Ridge)
+  nfolds    = 10,
+  standardize = TRUE      # standardize predictors (important for LASSO)
+)
+ 
+plot(lasso_cv)
+title("LASSO Cross-Validation — Lambda Selection", line = 3)
+ 
+# Best lambda (1 SE rule — more parsimonious model)
+best_lambda <- lasso_cv$lambda.1se
+cat("\nBest lambda (1SE):", round(best_lambda, 4), "\n")
+ 
+# Extract non-zero coefficients = selected variables
+lasso_coefs <- coef(lasso_cv, s = "lambda.1se")
+selected_vars <- rownames(lasso_coefs)[which(lasso_coefs != 0)]
+selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+ 
+cat("\nLASSO selected", length(selected_vars), "variables:\n")
+print(selected_vars)
+ 
+# LASSO predictions on test set
+lasso_preds <- predict(lasso_cv, newx = x_test, s = "lambda.1se") %>% as.vector()
+ 
+lasso_rmse <- sqrt(mean((y_test - lasso_preds)^2))
+lasso_r2   <- cor(y_test, lasso_preds)^2
+cat("\nLASSO Test RMSE:", round(lasso_rmse, 3))
+cat("\nLASSO Test R²:  ", round(lasso_r2, 3), "\n")
+ 
+# Coefficient plot — shows direction and magnitude of selected predictors
+lasso_coef_df <- data.frame(
+  variable    = selected_vars,
+  coefficient = as.vector(lasso_coefs[selected_vars, ])
+) %>% arrange(coefficient)
+ 
+ggplot(lasso_coef_df, aes(x = reorder(variable, coefficient), y = coefficient)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "LASSO Selected Predictors of Life Expectancy",
+       x = NULL, y = "Coefficient") +
+  theme_minimal()
+```
+
+
+
+
+
+

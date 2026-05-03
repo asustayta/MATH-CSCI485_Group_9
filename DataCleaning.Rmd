@@ -1,0 +1,269 @@
+# =============================================================================
+# HPI & Life Expectancy Project — Data Cleaning Script
+# =============================================================================
+# Datasets:
+#   1. HPI 3  — hpi_3_complete_file.xlsx  (8,057 CA census tracts)
+#   2. USALEEP — CDC life expectancy at birth by tract (to be joined)
+# Goal: Clean and merge data, prep for LASSO / Random Forest / XGBoost models
+# =============================================================================
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(janitor)   # clean_names(), tabyl()
+library(skimr)     # skim() for quick EDA summaries
+```
+
+# -----------------------------------------------------------------------------
+# 1. LOAD DATA
+# -----------------------------------------------------------------------------
+
+```{r}
+hpi_raw     <- read_excel("hpi_3_complete_file.xlsx", sheet = "HPI 3")
+usaleep_raw <- read_excel("CA_A.CSV.xlsx")
+```
+
+# -----------------------------------------------------------------------------
+# 2. STANDARDIZE COLUMN NAMES
+# -----------------------------------------------------------------------------
+
+```{r}
+hpi <- hpi_raw %>%
+  clean_names()           # snake_case, removes spaces/special chars
+
+usaleep <- usaleep_raw %>%
+  clean_names()           # "Tract ID" -> tract_id, "e(0)" -> e_0_, etc.
+```
+
+# -----------------------------------------------------------------------------
+# 3. INSPECT & DIAGNOSE
+# -----------------------------------------------------------------------------
+
+```{r}
+glimpse(hpi)
+skim(hpi)
+```
+
+# Check missing counts across all columns
+
+```{r}
+hpi_missing <- hpi %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+print(hpi_missing)
+```
+
+# -----------------------------------------------------------------------------
+# 4. CLEAN HPI DATASET
+# -----------------------------------------------------------------------------
+
+```{r}
+hpi_clean <- hpi %>%
+
+  # --- 4a. Drop metadata / admin columns not useful for modeling ---
+  select(-version, -notes) %>%
+
+  # --- 4b. Ensure GEO_ID is character (11-digit FIPS, zero-padded) ---
+  # HPI stores CA tracts as 10-digit integers; pad to standard 11-digit FIPS
+  mutate(
+    geo_id = str_pad(as.character(geo_id), width = 11, side = "left", pad = "0")
+  ) %>%
+
+  # --- 4c. Fix UrbanType: "no_data" string → true NA ---
+  mutate(
+    urban_type = na_if(urban_type, "no_data"),
+    urban_type = factor(urban_type,
+                        levels = c("rural", "urban_cluster", "urban_area"))
+  ) %>%
+
+  # --- 4d. Remove tracts with zero population (no meaningful health data) ---
+  filter(pop > 0) %>%
+
+  # --- 4e. Flag and optionally remove tracts missing LEB / HPI ---
+  # These 267 tracts are missing both — likely suppressed by CDC for small pop.
+  # We keep them in a separate object for transparency; drop from model data.
+  mutate(missing_leb = is.na(leb))
+
+# Separate: tracts with and without life expectancy
+hpi_model  <- hpi_clean %>% filter(!missing_leb)   # ~7,790 tracts for modeling
+hpi_no_leb <- hpi_clean %>% filter(missing_leb)    # 267 tracts — inspect later
+
+cat("Tracts available for modeling:", nrow(hpi_model), "\n")
+cat("Tracts dropped (missing LEB):", nrow(hpi_no_leb), "\n")
+
+# --- 4f. Sanity-check numeric ranges for key indicators ---
+# Percentile columns should be [0, 1] or [0, 100] — confirm
+hpi_model %>%
+  select(ends_with("_pctile")) %>%
+  summarise(across(everything(), list(min = min, max = max), na.rm = TRUE)) %>%
+  glimpse()
+
+# Race/ethnicity pcts should sum to ~100 per tract
+hpi_model <- hpi_model %>%
+  mutate(
+    pct_sum = latino_pct + white_pct + black_pct + asian_pct +
+              multiple_pct + native_am_pct + pacific_isl_pct + other_pct
+  )
+
+# Flag tracts where race pcts don't sum to ~100 (± 2 pp rounding tolerance)
+race_check <- hpi_model %>%
+  filter(abs(pct_sum - 100) > 2) %>%
+  select(geo_id, name, pct_sum)
+
+cat("Tracts with race pct sum outside 98–102%:", nrow(race_check), "\n")
+
+# Drop the diagnostic column
+hpi_model <- hpi_model %>% select(-pct_sum, -missing_leb)
+```
+
+# -----------------------------------------------------------------------------
+# 5. CLEAN USALEEP DATASET
+# -----------------------------------------------------------------------------
+
+# CA_A_CSV.xlsx columns after clean_names():
+#   tract_id, state2kx, cnty2kx, tract2kx, e_0_, se_e_0_, abridged_life_table_flag
+# File is already California-only — no state filtering needed.
+# Flag values: 1 = <25 deaths (least reliable), 2 = 25–99, 3 = 100+ deaths
+
+```{r}
+usaleep_clean <- usaleep %>%
+  rename(
+    geo_id   = tract_id,
+    leb_cdc  = e_0,
+    leb_se   = se_e_0,
+    leb_flag = abridged_life_table_flag
+  ) %>%
+  mutate(
+    geo_id = str_pad(as.character(geo_id), width = 11, side = "left", pad = "0")
+  ) %>%
+  # Drop flag 1 tracts (fewer than 25 deaths — estimates least reliable)
+  filter(leb_flag != 1) %>%
+  select(geo_id, leb_cdc, leb_se, leb_flag)
+
+cat("CA tracts in USALEEP after filtering:", nrow(usaleep_clean), "\n")
+# Expect ~7,100 tracts after dropping flag 1 (~416 removed)
+```
+
+# -----------------------------------------------------------------------------
+# 6. JOIN HPI + USALEEP ON CENSUS TRACT ID
+# -----------------------------------------------------------------------------
+
+# Note: HPI LEB is derived from CA-specific data; USALEEP is the CDC source.
+# We use USALEEP as our official response variable (leb_cdc).
+# The HPI's own LEB (leb) is kept for comparison / model benchmarking.
+
+```{r}
+merged <- hpi_model %>%
+  left_join(usaleep_clean, by = "geo_id")
+
+cat("Tracts after join:", nrow(merged), "\n")
+cat("Tracts missing CDC LEB after join:", sum(is.na(merged$leb_cdc)), "\n")
+
+# Drop tracts that couldn't be matched or are missing CDC life expectancy
+final_df <- merged %>%
+  filter(!is.na(leb_cdc))
+
+cat("Final analysis-ready tracts:", nrow(final_df), "\n")
+```
+
+# -----------------------------------------------------------------------------
+# 7. CREATE DERIVED / HELPER VARIABLES
+# -----------------------------------------------------------------------------
+
+```{r}
+final_df <- final_df %>%
+  mutate(
+    # Income quartile based on percapitaincome (useful for 2-way ANOVA)
+    income_quartile = ntile(percapitaincome, 4),
+    income_quartile = factor(income_quartile,
+                             labels = c("Q1_low", "Q2", "Q3", "Q4_high")),
+
+    # Majority-minority flag (non-white > 50%)
+    majority_minority = if_else(white_pct < 50, 1L, 0L),
+
+    # HPI quartile as factor (already exists; ensure it's a factor)
+    hpi_quartile = factor(hpi_quartile),
+
+    # Urban type with explicit NA as "unknown" level for modeling
+    urban_type = fct_explicit_na(urban_type, na_level = "unknown")
+  )
+```
+
+# -----------------------------------------------------------------------------
+# 8. VARIABLE GROUPS
+# -----------------------------------------------------------------------------
+
+```{r}
+# Raw indicator variables (23 HPI indicators, no percentile versions)
+indicators_raw <- c(
+  "abovepoverty", "automobile", "bachelorsed", "censusresponse",
+  "commute", "dieselpm", "employed", "h20contam", "homeownership",
+  "houserepair", "inhighschool", "inpreschool", "insured",
+  "ownsevere", "ozone", "parkaccess", "percapitaincome",
+  "pm25", "rentsevere", "retail", "treecanopy", "uncrowded", "voting"
+)
+
+# Domain composite scores
+domain_scores <- c(
+  "economic", "education", "insurance", "clean_enviro",
+  "housing", "neighborhood", "social", "transportation"
+)
+
+# Demographic variables
+demo_vars <- c(
+  "pop", "pctgqtract",
+  "latino_pct", "white_pct", "black_pct", "asian_pct",
+  "multiple_pct", "native_am_pct", "pacific_isl_pct", "other_pct"
+)
+
+# Response variable
+response_var <- "leb_cdc"
+```
+
+# -----------------------------------------------------------------------------
+# 9. SPLIT INTO MODELING SUBSETS
+# -----------------------------------------------------------------------------
+
+```{r}
+set.seed(42)
+
+# 80/20 train-test split (stratified by income_quartile)
+library(rsample)
+
+split      <- initial_split(final_df, prop = 0.80, strata = income_quartile)
+train_data <- training(split)
+test_data  <- testing(split)
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Test rows:    ", nrow(test_data), "\n")
+```
+
+# -----------------------------------------------------------------------------
+# 10. SAVE CLEANED DATA
+# -----------------------------------------------------------------------------
+
+```{r}
+write_csv(final_df,   "hpi_clean_full.csv")
+write_csv(train_data, "hpi_train.csv")
+write_csv(test_data,  "hpi_test.csv")
+
+# Save variable group vectors for use in modeling scripts
+saveRDS(
+  list(
+    indicators_raw = indicators_raw,
+    domain_scores  = domain_scores,
+    demo_vars      = demo_vars,
+    response_var   = response_var
+  ),
+  file = "variable_groups.rds"
+)
+
+cat("\n✓ Cleaning complete. Files written:\n")
+cat("  hpi_clean_full.csv  —", nrow(final_df), "tracts,", ncol(final_df), "cols\n")
+cat("  hpi_train.csv       —", nrow(train_data), "tracts\n")
+cat("  hpi_test.csv        —", nrow(test_data), "tracts\n")
+cat("  variable_groups.rds — variable name lists for modeling\n")
+```
