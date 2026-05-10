@@ -1,6 +1,6 @@
 # Predicting Life Expectancy in California 
 
-**Author:** Maya A., Matthew B., Neil M., Anna S.
+**Authors:** Maya A., Matthew B., Neil M., Anna S.
 
 **MATH-CSCI485:** Group 9
 
@@ -9,13 +9,15 @@
 This project focuses on predicting life expectancy across California census tracts using neighborhood level health, demographic, economic, housing, education, and environmental indicators. We used the California Healthy Places Index 3.0 dataset and combined it with CDC USALEEP life expectancy data to create a cleaned modeling dataset. The main goal was to see whether machine learning models could predict census tract life expectancy better than using the overall HPI score alone. The project includes data cleaning, exploratory analysis, statistical testing, clustering, and predictive modeling using LASSO, two-way ANOVA, K-means, Random Forest, XGBoost, and SHAP interpretation.
 
 ## Files Included
-   - `DataCleaning.Rmd`: 
-   - `Final.Rmd`: 
-   - `Final_Updated.Rmd`: 
-   - `hpi_clean_full.csv`: cleaned data set aggregated from the following
+   - `DataCleaning.Rmd`:
+         RMD file containing the cleaning of our two datasets, HPI 3 and USALEEP. Data was merged and prepped for our models of: LASSO, Random Forest, XGBoost. Rendered report executed into `DataCleaning.pdf`     
+   - `Final.Rmd`:  Early work of LASSO predictions and testing. Rendered report executed into `Final.pdf`
+   - `Final_Updated.Rmd`: File containing implementation of our models, variable selection, and statistical testing. Model comparision is included. Rendered report executed into `Final_Updated.rmd`
+   - `hpi_clean_full.csv`: cleaned data set aggregated from the following:
       - `CA_A.CSV.xlsl`:  CDC’s USALEEP dataset, which provides official life expectancy estimates across the United States containing 7,516 observations and 7 variables.
       - `hpi_3_complete_file.csv`: the California Healthy Places Index 3.0 (HPI), containing 8,057 California census tracts and 84 variables representing various aspects of community health.
-     
+   - `Final Report`:  Summary of implementation, test result and analysis, and conclusions and future work for this project.
+   - `Predicting Life Expectancy in California.pptx`: Power point presentation of application and context of project, with key solutions. 
   
 ## Execution
 
