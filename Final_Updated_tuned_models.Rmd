@@ -1,0 +1,557 @@
+```{r}
+library(tidyverse)
+library(glmnet)
+library(rsample)
+library(randomForest)
+library(xgboost)
+library(yardstick)
+library(ggplot2)
+library(shapviz)
+```
+
+# -----------------------------------------------------------------------------
+# 1. LOAD DATA & VARIABLE GROUPS
+# -----------------------------------------------------------------------------
+
+```{r}
+data <- read.csv("hpi_clean_full.csv")
+```
+
+```{r}
+set.seed(42)
+
+# 80/20 train-test split (stratified by income_quartile)
+split <- initial_split(data, prop = 0.80, strata = income_quartile)
+train_data <- training(split)
+test_data <- testing(split)
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Test rows:    ", nrow(test_data), "\n")
+```
+
+```{r}
+var_groups <- readRDS("variable_groups.rds")
+indicators_raw <- var_groups$indicators_raw
+domain_scores <- var_groups$domain_scores
+demo_vars <- var_groups$demo_vars
+response_var <- var_groups$response_var
+
+# Re-apply factor levels lost during CSV write
+train_data <- train_data %>%
+  mutate(
+    income_quartile = factor(income_quartile,
+                             levels = c("Q1_low", "Q2", "Q3", "Q4_high")),
+    hpi_quartile = factor(hpi_quartile),
+    urban_type = factor(urban_type)
+  )
+ 
+test_data <- test_data %>%
+  mutate(
+    income_quartile = factor(income_quartile,
+                             levels = c("Q1_low", "Q2", "Q3", "Q4_high")),
+    hpi_quartile    = factor(hpi_quartile),
+    urban_type      = factor(urban_type)
+  )
+ 
+```
+
+# -----------------------------------------------------------------------------
+# 2. CREATE REGION VARIABLE FROM COUNTIES
+# -----------------------------------------------------------------------------
+
+```{r}
+bay_area <- c(
+  "Alameda", "Contra Costa", "Marin", "Napa", "San Francisco",
+  "San Mateo", "Santa Clara", "Solano", "Sonoma"
+)
+socal <- c(
+  "Los Angeles", "Orange", "Riverside", "San Bernardino",
+  "San Diego", "Imperial", "Ventura"
+)
+central_valley <- c(
+  "Fresno", "Kern", "Kings", "Madera", "Merced",
+  "San Joaquin", "Stanislaus", "Tulare"
+)
+norcal <- c(
+  "Butte", "Colusa", "Del Norte", "Glenn", "Humboldt", "Lake",
+  "Lassen", "Mendocino", "Modoc", "Plumas", "Shasta", "Sierra",
+  "Siskiyou", "Tehama", "Trinity"
+)
+ 
+assign_region <- function(county_name) {
+  case_when(
+    county_name %in% bay_area       ~ "Bay Area",
+    county_name %in% socal          ~ "SoCal",
+    county_name %in% central_valley ~ "Central Valley",
+    county_name %in% norcal         ~ "NorCal",
+    TRUE                            ~ "Other CA"
+  )
+}
+ 
+train_data <- train_data %>%
+  mutate(region = factor(assign_region(county)))
+ 
+test_data <- test_data %>%
+  mutate(region = factor(assign_region(county)))
+ 
+final_df <- final_df %>%
+  mutate(region = factor(assign_region(county)))
+ 
+cat("Region distribution in training data:\n")
+print(table(train_data$region))
+```
+
+# -----------------------------------------------------------------------------
+# 3. LASSO — VARIABLE SELECTION
+# -----------------------------------------------------------------------------
+
+```{r}
+lasso_vars <- c(indicators_raw, demo_vars)
+ 
+x_train <- train_data %>%
+  select(all_of(lasso_vars)) %>%
+  drop_na() %>%
+  as.matrix()
+ 
+y_train <- train_data %>%
+  filter(complete.cases(select(., all_of(lasso_vars)))) %>%
+  pull(leb_cdc)
+ 
+x_test <- test_data %>%
+  select(all_of(lasso_vars)) %>%
+  drop_na() %>%
+  as.matrix()
+ 
+y_test <- test_data %>%
+  filter(complete.cases(select(., all_of(lasso_vars)))) %>%
+  pull(leb_cdc)
+ 
+# Cross-validated LASSO to find optimal lambda
+set.seed(42)
+lasso_cv <- cv.glmnet(
+  x         = x_train,
+  y         = y_train,
+  alpha     = 1,          # alpha=1 is LASSO (alpha=0 is Ridge)
+  nfolds    = 10,
+  standardize = TRUE      # standardize predictors (important for LASSO)
+)
+ 
+plot(lasso_cv)
+title("LASSO Cross-Validation — Lambda Selection", line = 3)
+ 
+# Best lambda (1 SE rule — more parsimonious model)
+best_lambda <- lasso_cv$lambda.1se
+cat("\nBest lambda (1SE):", round(best_lambda, 4), "\n")
+ 
+# Extract non-zero coefficients = selected variables
+lasso_coefs <- coef(lasso_cv, s = "lambda.1se")
+selected_vars <- rownames(lasso_coefs)[which(lasso_coefs != 0)]
+selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+ 
+cat("\nLASSO selected", length(selected_vars), "variables:\n")
+print(selected_vars)
+ 
+# LASSO predictions on test set
+lasso_preds <- predict(lasso_cv, newx = x_test, s = "lambda.1se") %>% as.vector()
+ 
+lasso_rmse <- sqrt(mean((y_test - lasso_preds)^2))
+lasso_r2   <- cor(y_test, lasso_preds)^2
+cat("\nLASSO Test RMSE:", round(lasso_rmse, 3))
+cat("\nLASSO Test R²:  ", round(lasso_r2, 3), "\n")
+ 
+# Coefficient plot — shows direction and magnitude of selected predictors
+lasso_coef_df <- data.frame(
+  variable    = selected_vars,
+  coefficient = as.vector(lasso_coefs[selected_vars, ])
+) %>% arrange(coefficient)
+ 
+ggplot(lasso_coef_df, aes(x = reorder(variable, coefficient), y = coefficient)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "LASSO Selected Predictors of Life Expectancy",
+       x = NULL, y = "Coefficient") +
+  theme_minimal()
+```
+
+# -----------------------------------------------------------------------------
+# 4. 2-WAY ANOVA — REGION x INCOME LEVEL
+# -----------------------------------------------------------------------------
+
+```{r}
+anova_df <- final_df %>%
+  select(leb_cdc, region, income_quartile) %>%
+  drop_na()
+ 
+# Check cell counts (need reasonable n per cell)
+cat("\nCell counts (region x income_quartile):\n")
+print(table(anova_df$region, anova_df$income_quartile))
+ 
+# Fit 2-way ANOVA with interaction
+anova_model <- aov(leb_cdc ~ region * income_quartile, data = anova_df)
+cat("\n2-Way ANOVA Results:\n")
+print(summary(anova_model))
+ 
+# Post-hoc: Tukey HSD to see which pairs differ significantly
+tukey_results <- TukeyHSD(anova_model)
+cat("\nTukey HSD — Region:\n")
+print(tukey_results$region)
+cat("\nTukey HSD — Income Quartile:\n")
+print(tukey_results$income_quartile)
+ 
+# Interaction plot — visualize how income effect varies by region
+anova_df %>%
+  group_by(region, income_quartile) %>%
+  summarise(mean_leb = mean(leb_cdc, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = income_quartile, y = mean_leb,
+             color = region, group = region)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(title = "Mean Life Expectancy by Region and Income Quartile",
+       x = "Income Quartile", y = "Mean Life Expectancy (years)",
+       color = "Region") +
+  theme_minimal()
+ 
+# Check ANOVA assumptions
+par(mfrow = c(2, 2))
+plot(anova_model)
+par(mfrow = c(1, 1))
+```
+
+# -----------------------------------------------------------------------------
+# 5. K-MEANS CLUSTERING
+# -----------------------------------------------------------------------------
+```{r}
+# Use LASSO-selected variables for clustering
+cluster_vars <- intersect(selected_vars, colnames(train_data))
+ 
+cluster_df <- final_df %>%
+  select(geo_id, all_of(cluster_vars)) %>%
+  drop_na()
+ 
+# Scale variables (k-means is distance-based, scaling is required)
+cluster_scaled <- cluster_df %>%
+  select(-geo_id) %>%
+  scale()
+ 
+# Elbow plot — find optimal number of clusters
+set.seed(42)
+wss <- map_dbl(1:10, ~ {
+  kmeans(cluster_scaled, centers = .x, nstart = 25, iter.max = 100)$tot.withinss
+})
+ 
+tibble(k = 1:10, wss = wss) %>%
+  ggplot(aes(x = k, y = wss)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "K-Means Elbow Plot",
+       x = "Number of Clusters (k)", y = "Total Within-Cluster SS") +
+  theme_minimal()
+ 
+# Fit k-means with chosen k (adjust after reviewing elbow plot)
+k_chosen <- 4
+ 
+set.seed(42)
+kmeans_fit <- kmeans(cluster_scaled, centers = k_chosen,
+                     nstart = 25, iter.max = 100)
+ 
+# Add cluster labels back to data
+cluster_df <- cluster_df %>%
+  mutate(cluster = factor(kmeans_fit$cluster))
+ 
+final_df <- final_df %>%
+  left_join(cluster_df %>% select(geo_id, cluster), by = "geo_id")
+ 
+cat("\nCluster sizes:\n")
+print(table(cluster_df$cluster))
+ 
+# Profile clusters by mean life expectancy
+final_df %>%
+  group_by(cluster) %>%
+  summarise(
+    n          = n(),
+    mean_leb   = mean(leb_cdc, na.rm = TRUE),
+    mean_hpi   = mean(hpi, na.rm = TRUE),
+    mean_income = mean(percapitaincome, na.rm = TRUE)
+  ) %>%
+  arrange(mean_leb) %>%
+  print()
+```
+
+# -----------------------------------------------------------------------------
+# 6. RANDOM FOREST (Tuned)
+# -----------------------------------------------------------------------------
+```{r}
+library(caret)
+library(randomForest)
+
+rf_vars <- selected_vars
+
+rf_train <- train_data %>%
+  select(all_of(c(rf_vars, "leb_cdc"))) %>%
+  drop_na()
+
+rf_test <- test_data %>%
+  select(all_of(c(rf_vars, "leb_cdc"))) %>%
+  drop_na()
+
+# --- 1. tuneRF: finds the best mtry value specifically ---
+set.seed(42)
+tune_result <- tuneRF(
+  x          = rf_train %>% select(-leb_cdc),
+  y          = rf_train$leb_cdc,
+  stepFactor = 1.5,      # how aggressively mtry is increased/decreased
+  improve    = 0.01,     # minimum improvement to keep searching
+  ntreeTry   = 300,      # trees used during tuning (not the final model)
+  trace      = TRUE,
+  plot       = TRUE
+)
+
+best_mtry <- tune_result[which.min(tune_result[, "OOBError"]), "mtry"]
+cat("Best mtry:", best_mtry, "\n")
+
+# --- 2. caret grid search: tunes mtry with cross-validation ---
+train_control <- trainControl(
+  method  = "cv",     # k-fold cross-validation
+  number  = 5,        # 5 folds
+  search  = "grid"
+)
+
+tune_grid <- expand.grid(
+  mtry = c(8, 10, 12),  # values to try
+  nodesize = c(10, 15, 20, 30),
+  maxnodes = c(100, 150, NA)
+)
+
+cat("Total combinations to search:", nrow(tune_grid), "\n")
+
+# --- 2. Manual cross-validated grid search ---
+set.seed(42)
+k <- 5
+folds <- sample(rep(1:k, length.out = nrow(rf_train)))
+
+best_rmse   <- Inf
+best_params <- NULL
+
+for (i in seq_len(nrow(tune_grid))) {
+  fold_rmses <- numeric(k)
+
+  for (fold in 1:k) {
+    fold_train <- rf_train[folds != fold, ]
+    fold_val   <- rf_train[folds == fold, ]
+
+    # Handle NA maxnodes (unlimited)
+    maxnodes_val <- if (is.na(tune_grid$maxnodes[i])) NULL else tune_grid$maxnodes[i]
+
+    rf_candidate <- randomForest(
+      x        = fold_train %>% select(-leb_cdc),
+      y        = fold_train$leb_cdc,
+      ntree    = 500,
+      mtry     = tune_grid$mtry[i],
+      nodesize = tune_grid$nodesize[i],
+      maxnodes = maxnodes_val
+    )
+
+    preds          <- predict(rf_candidate, newdata = fold_val %>% select(-leb_cdc))
+    fold_rmses[fold] <- sqrt(mean((fold_val$leb_cdc - preds)^2))
+  }
+
+  mean_rmse <- mean(fold_rmses)
+
+  if (mean_rmse < best_rmse) {
+    best_rmse   <- mean_rmse
+    best_params <- tune_grid[i, ]
+  }
+}
+
+cat("\nBest CV RMSE:", round(best_rmse, 3), "\n")
+cat("Best params:\n")
+print(best_params)
+
+# --- 3. Fit final model using best params ---
+best_maxnodes <- if (is.na(best_params$maxnodes)) NULL else best_params$maxnodes
+
+set.seed(42)
+rf_model <- randomForest(
+  x          = rf_train %>% select(-leb_cdc),
+  y          = rf_train$leb_cdc,
+  ntree      = 500,
+  mtry       = best_params$mtry,
+  nodesize   = best_params$nodesize,
+  maxnodes   = best_maxnodes,
+  importance = TRUE
+)
+
+print(rf_model)
+varImpPlot(rf_model, main = "Random Forest — Variable Importance")
+
+# --- 4. Test set evaluation ---
+rf_preds <- predict(rf_model, newdata = rf_test %>% select(-leb_cdc))
+
+rf_rmse <- sqrt(mean((rf_test$leb_cdc - rf_preds)^2))
+rf_r2   <- cor(rf_test$leb_cdc, rf_preds)^2
+cat("\nRandom Forest Test RMSE:", round(rf_rmse, 3))
+cat("\nRandom Forest Test R²:  ", round(rf_r2, 3), "\n")
+```
+
+# -----------------------------------------------------------------------------
+# 7. XGBOOST (Further Tuned)
+# -----------------------------------------------------------------------------
+```{r}
+library(xgboost)
+
+xgb_vars <- selected_vars
+
+xgb_train_x <- train_data %>%
+  select(all_of(xgb_vars)) %>%
+  drop_na() %>%
+  as.matrix()
+
+xgb_train_y <- train_data %>%
+  filter(complete.cases(select(., all_of(xgb_vars)))) %>%
+  pull(leb_cdc)
+
+xgb_test_x <- test_data %>%
+  select(all_of(xgb_vars)) %>%
+  drop_na() %>%
+  as.matrix()
+
+xgb_test_y <- test_data %>%
+  filter(complete.cases(select(., all_of(xgb_vars)))) %>%
+  pull(leb_cdc)
+
+dtrain <- xgb.DMatrix(data = xgb_train_x, label = xgb_train_y)
+dtest  <- xgb.DMatrix(data = xgb_test_x,  label = xgb_test_y)
+
+# --- 1. Updated grid extending beyond previous boundaries ---
+tune_grid <- expand.grid(
+  max_depth          = c(3, 4, 6),
+  learning_rate      = c(0.003, 0.005, 0.01),  # extend lower since 0.01 won
+  subsample          = c(0.7, 0.8, 1.0),
+  colsample_bytree   = c(0.7, 0.8, 1.0),
+  min_child_weight   = c(5, 10, 15)             # extend higher since 5 won
+)
+
+cat("Total combinations to search:", nrow(tune_grid), "\n")
+
+# --- 2. Grid search with higher nrounds ceiling ---
+set.seed(42)
+best_rmse   <- Inf
+best_params <- NULL
+best_rounds <- NULL
+
+for (i in seq_len(nrow(tune_grid))) {
+  params_candidate <- list(
+    objective        = "reg:squarederror",
+    learning_rate    = tune_grid$learning_rate[i],
+    max_depth        = tune_grid$max_depth[i],
+    subsample        = tune_grid$subsample[i],
+    colsample_bytree = tune_grid$colsample_bytree[i],
+    min_child_weight = tune_grid$min_child_weight[i]
+  )
+
+  cv_result <- xgb.cv(
+    data                  = dtrain,
+    nrounds               = 1000,   # increased from 500
+    nfold                 = 5,
+    params                = params_candidate,
+    early_stopping_rounds = 50,     # increased to give more patience
+    verbose               = 0
+  )
+
+  min_rmse  <- min(cv_result$evaluation_log$test_rmse_mean)
+  best_iter <- which.min(cv_result$evaluation_log$test_rmse_mean)
+
+  if (min_rmse < best_rmse) {
+    best_rmse   <- min_rmse
+    best_params <- params_candidate
+    best_rounds <- best_iter
+  }
+}
+
+cat("\nBest CV RMSE:   ", round(best_rmse, 3), "\n")
+cat("Best nrounds:   ", best_rounds, "\n")
+cat("Best learning_rate:  ", best_params$learning_rate, "\n")
+cat("Best max_depth:      ", best_params$max_depth, "\n")
+cat("Best subsample:      ", best_params$subsample, "\n")
+cat("Best colsample_bytree:", best_params$colsample_bytree, "\n")
+cat("Best min_child_weight:", best_params$min_child_weight, "\n")
+
+# --- 3. Fit final model ---
+set.seed(42)
+xgb_model <- xgb.train(
+  data    = dtrain,
+  nrounds = best_rounds,
+  params  = best_params,
+  verbose = 0
+)
+
+# Feature importance
+xgb_importance <- xgb.importance(model = xgb_model)
+xgb.plot.importance(xgb_importance, top_n = 15,
+                    main = "XGBoost — Feature Importance")
+
+# --- 4. Test set evaluation ---
+xgb_preds <- predict(xgb_model, dtest)
+
+xgb_rmse <- sqrt(mean((xgb_test_y - xgb_preds)^2))
+xgb_r2   <- cor(xgb_test_y, xgb_preds)^2
+cat("\nXGBoost Test RMSE:", round(xgb_rmse, 3))
+cat("\nXGBoost Test R²:  ", round(xgb_r2, 3), "\n")
+```
+
+# -----------------------------------------------------------------------------
+# 8. MODEL COMPARISON — YOUR MODEL vs HPI BASELINE
+# -----------------------------------------------------------------------------
+```{r}
+hpi_baseline_df <- test_data %>%
+  select(leb_cdc, hpi) %>%
+  drop_na()
+ 
+hpi_baseline_model <- lm(leb_cdc ~ hpi, data = hpi_baseline_df)
+hpi_baseline_preds <- predict(hpi_baseline_model, hpi_baseline_df)
+ 
+hpi_rmse <- sqrt(mean((hpi_baseline_df$leb_cdc - hpi_baseline_preds)^2))
+hpi_r2   <- cor(hpi_baseline_df$leb_cdc, hpi_baseline_preds)^2
+ 
+# Summary comparison table
+comparison <- tibble(
+  Model    = c("HPI Baseline (linear)", "LASSO", "Random Forest", "XGBoost"),
+  RMSE     = round(c(hpi_rmse, lasso_rmse, rf_rmse, xgb_rmse), 3),
+  R_squared = round(c(hpi_r2, lasso_r2, rf_r2, xgb_r2), 3)
+) %>%
+  arrange(RMSE)
+ 
+cat("\n=== MODEL COMPARISON ===\n")
+print(comparison)
+ 
+# Visual comparison
+comparison %>%
+  pivot_longer(cols = c(RMSE, R_squared), names_to = "metric") %>%
+  ggplot(aes(x = reorder(Model, value), y = value, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ metric, scales = "free_y") +
+  coord_flip() +
+  labs(title = "Model Comparison — RMSE and R²",
+       x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+# -----------------------------------------------------------------------------
+# 8. SHAP
+# -----------------------------------------------------------------------------
+
+```{r}
+shap <- shapviz(xgb_model, X_pred = xgb_test_x)
+
+sv_importance(shap, kind = "beeswarm") +
+  labs(title = "SHAP Beeswarrm - Feature Impact on Life Expectancy")
+
+sv_importance(shap, kind = "bar") +
+  labs(title = "SHAP Feature Importance (Mean |SHAP|)")
+
+sv_dependence(shap, v = "percapitaincome") +
+  labs(title = "SHAP Dependence - Per Capita Income")
+
+sv_waterfall(shap, row_id = 1) +
+  labs(title = "SHAP Waterfall - Single Tract Breakdown")
+```
